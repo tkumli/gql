@@ -23,7 +23,7 @@ Add `gql` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:gql_builder, "~> 0.1.0"}
+    {:gql, "~> 0.1.0", hex: :gql_builder}
   ]
 end
 ```
