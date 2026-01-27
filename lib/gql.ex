@@ -577,7 +577,6 @@ defmodule GQL do
   end
 
   defp add_subfield(doc, {subfield_name, subfield_opts}, path) when is_list(subfield_opts) do
-    # Validate that path option is not present
     if Keyword.has_key?(subfield_opts, :path) do
       raise ArgumentError, "the `path` option is not allowed in subfield definitions"
     end
@@ -585,48 +584,37 @@ defmodule GQL do
     field(doc, subfield_name, Keyword.put(subfield_opts, :path, path))
   end
 
+  # Parse path element into normalized {name, alias, args} tuple or inline fragment specification
+  defp parse_path_element({nil, opts}) when is_list(opts) do
+    {:inline_fragment, Keyword.get(opts, :type)}
+  end
+
+  defp parse_path_element({name, opts}) when is_list(opts) do
+    {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
+  end
+
+  defp parse_path_element(name) do
+    {to_string(name), nil, []}
+  end
+
   # Helper to build navigation for a single path element
   defp build_path_navigation({nil, opts}) when is_list(opts) do
-    # This is for matching inline fragments by type
     type = Keyword.get(opts, :type)
+    type_str = type && to_string(type)
 
-    if type do
-      type_str = to_string(type)
-
-      [
-        access_key(:selection_set, nil, %SelectionSet{}),
-        access_key(:selections, [], []),
-        Access.filter(fn
-          %InlineFragment{type_condition: %NamedType{name: ^type_str}} -> true
-          _ -> false
-        end)
-      ]
-    else
-      # Match inline fragments without type condition
-      [
-        access_key(:selection_set, nil, %SelectionSet{}),
-        access_key(:selections, [], []),
+    filter =
+      if type do
+        Access.filter(&match?(%InlineFragment{type_condition: %NamedType{name: ^type_str}}, &1))
+      else
         Access.filter(&match?(%InlineFragment{type_condition: nil}, &1))
-      ]
-    end
+      end
+
+    [access_key(:selection_set, nil, %SelectionSet{}), access_key(:selections, [], []), filter]
   end
 
-  defp build_path_navigation({name, opts}) when is_list(opts) do
-    {name, alias, args} =
-      {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-    field = %Field{name: name, alias: alias && to_string(alias), arguments: arguments(args)}
-
-    [
-      access_key(:selection_set, nil, %SelectionSet{}),
-      access_key(:selections, nil, []),
-      access_or_create_field(name, field)
-    ]
-  end
-
-  defp build_path_navigation(name) do
-    name = to_string(name)
-    field = %Field{name: name, arguments: []}
+  defp build_path_navigation(path_element) do
+    {name, alias_name, args} = parse_path_element(path_element)
+    field = %Field{name: name, alias: alias_name && to_string(alias_name), arguments: arguments(args)}
 
     [
       access_key(:selection_set, nil, %SelectionSet{}),
@@ -639,47 +627,36 @@ defmodule GQL do
   defp access_or_create_field(name, default_field) do
     fn
       :get, data, next when is_list(data) ->
-        # Find matching field
-        case Enum.find(data, &match_field(&1, name)) do
-          nil ->
-            # Field doesn't exist, return the default
-            next.(default_field)
-
-          field ->
-            next.(field)
+        data
+        |> Enum.find(&match_field(&1, name))
+        |> case do
+          nil -> next.(default_field)
+          field -> next.(field)
         end
 
       :get_and_update, data, next when is_list(data) ->
-        # Find matching field
         case Enum.find_index(data, &match_field(&1, name)) do
           nil ->
-            # Field doesn't exist, create it
             case next.(default_field) do
-              {get, updated_field} ->
-                # Insert the new field at the end
-                {get, data ++ [updated_field]}
-
-              :pop ->
-                # Don't insert anything
-                {default_field, data}
+              {get, updated_field} -> {get, data ++ [updated_field]}
+              :pop -> {default_field, data}
             end
 
           index ->
-            # Field exists, update it
-            field = Enum.at(data, index)
-
-            case next.(field) do
-              {get, updated_field} ->
-                {get, List.replace_at(data, index, updated_field)}
-
-              :pop ->
-                {field, List.delete_at(data, index)}
+            case next.(Enum.at(data, index)) do
+              {get, updated_field} -> {get, List.replace_at(data, index, updated_field)}
+              :pop -> {Enum.at(data, index), List.delete_at(data, index)}
             end
         end
     end
   end
 
-  defp match_field(%Field{} = f, name), do: f.alias == name || f.name == name
+  defp match_field(%Field{} = f, name) do
+    # If the field has an alias, only match on alias
+    # If no alias, match on name
+    if f.alias, do: f.alias == name, else: f.name == name
+  end
+
   defp match_field(_, _), do: false
 
   @doc """
@@ -704,36 +681,7 @@ defmodule GQL do
     {_type, wrapped_value} = wrap_value(value)
     argument = %Argument{name: name, value: wrapped_value}
 
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, alias, args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: alias && to_string(alias),
-            arguments: arguments(args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        Access.key(:arguments, [])
-      ]
-      |> List.flatten()
-
+    optic = build_field_optic(path, :arguments)
     update_in(doc, optic, fn argument_list -> (argument_list || []) ++ [argument] end)
   end
 
@@ -780,44 +728,19 @@ defmodule GQL do
     alias_name = Keyword.get(opts, :alias)
     args = Keyword.get(opts, :args, [])
 
-    # Build optic to navigate to the selections containing the field
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, field_alias, field_args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
+    optic = build_field_optic(path, :selections)
 
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: field_alias && to_string(field_alias),
-            arguments: arguments(field_args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        access_key(:selection_set, nil, %SelectionSet{}),
-        Access.key(:selections, [])
-      ]
-      |> List.flatten()
-
-    # Update the field in place, preserving its selection_set
     update_in(doc, optic, fn selections ->
       Enum.map(selections || [], fn
-        %Field{} = field when field.name == name or field.alias == name ->
-          # Update the field while preserving its selection_set
-          %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
+        %Field{} = field ->
+          # If field has an alias, only match on alias; otherwise match on name
+          matches = if field.alias, do: field.alias == name, else: field.name == name
+
+          if matches do
+            %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
+          else
+            field
+          end
 
         other ->
           other
@@ -847,39 +770,15 @@ defmodule GQL do
     name = to_string(name)
     path = Keyword.get(opts, :path, []) |> List.wrap()
 
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, alias, args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: alias && to_string(alias),
-            arguments: arguments(args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        access_key(:selection_set, nil, %SelectionSet{}),
-        Access.key(:selections, [])
-      ]
-      |> List.flatten()
+    optic = build_field_optic(path, :selections)
 
     update_in(doc, optic, fn selections ->
-      Enum.reject(selections || [], &(&1.alias == name || &1.name == name))
+      Enum.reject(selections || [], fn selection ->
+        alias_val = Map.get(selection, :alias)
+        name_val = Map.get(selection, :name)
+        # If has alias, only match on alias; otherwise match on name
+        if alias_val, do: alias_val == name, else: name_val == name
+      end)
     end)
   end
 
@@ -943,35 +842,7 @@ defmodule GQL do
     path = List.wrap(path)
     key = to_string(key)
 
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, alias, args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: alias && to_string(alias),
-            arguments: arguments(args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        Access.key(:arguments, [])
-      ]
-      |> List.flatten()
+    optic = build_field_optic(path, :arguments)
 
     update_in(doc, optic, fn arguments ->
       Enum.reject(arguments || [], &(&1.name == key))
@@ -1034,40 +905,8 @@ defmodule GQL do
     path = List.wrap(path)
     name = to_string(name)
 
-    directive = %Directive{
-      name: name,
-      arguments: arguments(directive_args)
-    }
-
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, alias, args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: alias && to_string(alias),
-            arguments: arguments(args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        Access.key(:directives, [])
-      ]
-      |> List.flatten()
+    directive = %Directive{name: name, arguments: arguments(directive_args)}
+    optic = build_field_optic(path, :directives)
 
     update_in(doc, optic, fn directive_list -> (directive_list || []) ++ [directive] end)
   end
@@ -1394,12 +1233,7 @@ defmodule GQL do
     path = Keyword.get(opts, :path, []) |> List.wrap()
     subfields = Keyword.get(opts, :fields, [])
 
-    type_condition =
-      if type do
-        %NamedType{name: to_string(type)}
-      else
-        nil
-      end
+    type_condition = type && %NamedType{name: to_string(type)}
 
     inline_fragment = %InlineFragment{
       type_condition: type_condition,
@@ -1408,40 +1242,9 @@ defmodule GQL do
       loc: %{line: nil}
     }
 
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        Access.all(),
-        for field_name <- path do
-          {field_name, alias, args} =
-            case field_name do
-              {name, opts} ->
-                {to_string(name), Keyword.get(opts, :alias), Keyword.get(opts, :args, [])}
-
-              _ ->
-                {to_string(field_name), nil, []}
-            end
-
-          field = %Field{
-            name: field_name,
-            alias: alias && to_string(alias),
-            arguments: arguments(args)
-          }
-
-          [
-            access_key(:selection_set, nil, %SelectionSet{}),
-            access_key(:selections, [], [field]),
-            Access.filter(&(&1.alias == field_name || &1.name == field_name))
-          ]
-        end,
-        access_key(:selection_set, nil, %SelectionSet{}),
-        Access.key(:selections, [])
-      ]
-      |> List.flatten()
-
+    optic = build_field_optic(path, :selections)
     doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
 
-    # Add subfields if the fields option is present
     subfield_path = path ++ [{nil, type: type}]
 
     Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
@@ -1612,6 +1415,39 @@ defmodule GQL do
 
   ### Helpers
 
+  # Build a common optic for navigating to a field property (arguments, directives, selections)
+  defp build_field_optic(path, target_key) do
+    [
+      access_key(:definitions, nil, []),
+      Access.all(),
+      for path_element <- path do
+        {name, alias_name, args} = parse_path_element(path_element)
+
+        field = %Field{
+          name: name,
+          alias: alias_name && to_string(alias_name),
+          arguments: arguments(args)
+        }
+
+        [
+          access_key(:selection_set, nil, %SelectionSet{}),
+          access_key(:selections, [], [field]),
+          Access.filter(fn selection ->
+            alias_val = Map.get(selection, :alias)
+            name_val = Map.get(selection, :name)
+            # If has alias, only match on alias; otherwise match on name
+            if alias_val, do: alias_val == name, else: name_val == name
+          end)
+        ]
+      end,
+      case target_key do
+        :selections -> [access_key(:selection_set, nil, %SelectionSet{}), Access.key(:selections, [])]
+        _ -> Access.key(target_key, [])
+      end
+    ]
+    |> List.flatten()
+  end
+
   defp merge_definitions([single]), do: single
 
   defp merge_definitions(definitions) do
@@ -1645,7 +1481,7 @@ defmodule GQL do
     # We preserve order by processing fields left-to-right
     {result, _seen} =
       Enum.reduce(fields, {[], %{}}, fn field, {acc, seen} ->
-        field_identifier = field.alias || field.name
+        field_identifier = Map.get(field, :alias) || Map.get(field, :name)
 
         args_signature =
           field.arguments
@@ -1866,7 +1702,7 @@ defmodule GQL do
   defp _paths(%SelectionSet{selections: selections}) do
     nested_paths =
       for field <- selections, field.selection_set != nil do
-        field_name = field.alias || field.name
+        field_name = Map.get(field, :alias) || Map.get(field, :name)
 
         for path <- _paths(field.selection_set) do
           [field_name | path]
