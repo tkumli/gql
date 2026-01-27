@@ -170,10 +170,10 @@ defmodule GQL do
   @doc """
   Initializes a new, empty #{@gql} document.
 
-      iex> #{@gql}.new() |> to_string()
+      iex> #{@gql}.new(field: "x") |> to_string()
       \"\"\"
       query {
-        
+        x
       }
       \"\"\"
 
@@ -421,12 +421,14 @@ defmodule GQL do
 
       iex> import #{@gql}
       iex> new()
+      ...> |> field(:x)
       ...> |> fragment(:UserFields, :User)
       ...> |> field(:name, path: [:UserFields])
       ...> |> field(:email, path: [:UserFields])
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
       \"\"\"
       query {
+        x
       }
       fragment UserFields on User {
         email
@@ -943,33 +945,36 @@ defmodule GQL do
 
   Creating a basic fragment on a User type:
 
-      iex> #{@gql}.new()
+      iex> #{@gql}.new(field: "x")
       ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.field("y", path: [:UserFields])
       ...> |> to_string() |> String.replace("\\n\\n", "\\n")
       \"\"\"
       query {
-        
+        x
       }
       fragment UserFields on User {
-        
+        y
       }
       \"\"\"
 
   Creating multiple fragments:
 
-      iex> #{@gql}.new()
+      iex> #{@gql}.new(field: "x")
       ...> |> #{@gql}.fragment(:BasicUser, :User)
       ...> |> #{@gql}.fragment(:PostInfo, :Post)
+      ...> |> #{@gql}.field("y", path: :BasicUser)
+      ...> |> #{@gql}.field("z", path: :PostInfo)
       ...> |> to_string() |> String.replace("\\n\\n", "\\n")
       \"\"\"
       query {
-        
+        x
       }
       fragment BasicUser on User {
-        
+        y
       }
       fragment PostInfo on Post {
-        
+        z
       }
       \"\"\"
 
@@ -999,6 +1004,7 @@ defmodule GQL do
       ...> |> #{@gql}.fragment(:UserFields, :User)
       ...> |> #{@gql}.fragment(:PostInfo, :Post)
       ...> |> #{@gql}.remove_fragment(:UserFields)
+      ...> |> #{@gql}.field("x", path: :PostInfo)
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
       \"\"\"
       query {
@@ -1007,6 +1013,7 @@ defmodule GQL do
         }
       }
       fragment PostInfo on Post {
+        x
       }
       \"\"\"
 
@@ -1015,6 +1022,7 @@ defmodule GQL do
       iex> "query { user { id } }"
       ...> |> #{@gql}.fragment(:UserFields, :User)
       ...> |> #{@gql}.remove_fragment(:NonExistent)
+      ...> |> #{@gql}.field("x", path: :UserFields)
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
       \"\"\"
       query {
@@ -1023,6 +1031,7 @@ defmodule GQL do
         }
       }
       fragment UserFields on User {
+        x
       }
       \"\"\"
 
@@ -1542,6 +1551,46 @@ defmodule GQL do
         end
     end
   end
+
+  def all2(default) do
+    all = Access.all()
+
+    fn
+      op, [], next ->
+        all.(op, [default], next)
+
+      op, data, next ->
+        all.(op, data, next)
+    end
+  end
+
+  def all do
+    &all/3
+  end
+
+  defp all(:get, data, next) when is_list(data) do
+    Enum.map(data, next)
+  end
+
+  defp all(:get_and_update, data, next) when is_list(data) do
+    all(data, next, _gets = [], _updates = [])
+  end
+
+  defp all(_op, data, _next) do
+    raise "Access.all/0 expected a list, got: #{inspect(data)}"
+  end
+
+  defp all([head | rest], next, gets, updates) do
+    case next.(head) do
+      {get, update} -> all(rest, next, [get | gets], [update | updates])
+      :pop -> all(rest, next, [head | gets], updates)
+    end
+  end
+
+  defp all([], _next, gets, updates) do
+    {:lists.reverse(gets), :lists.reverse(updates)}
+  end
+
 
   defp substitute(value, src, dst) do
     if value == src, do: dst, else: value
