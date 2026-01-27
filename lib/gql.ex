@@ -9,6 +9,8 @@ alias Absinthe.Language.{
   FloatValue,
   EnumValue,
   ListValue,
+  ObjectValue,
+  ObjectField,
   NullValue
 }
 
@@ -1709,6 +1711,15 @@ defmodule GQL do
   defp wrap_value(atom) when is_atom(atom), do: {nil, %EnumValue{value: atom}}
   defp wrap_value("$" <> name), do: {nil, %Variable{name: name}}
   defp wrap_value("" <> string), do: {"String", %StringValue{value: string}}
+
+  defp wrap_value(%{} = map) do
+    {nil, %ObjectValue{fields:
+      for {name, value} <- map do
+        {_, value} = wrap_value(value)
+        %ObjectField{name: to_string(name), value: value}
+      end
+    }}
+  end
 
   defp wrap_value(list) when is_list(list) do
     {types, values} = Enum.unzip(Enum.map(list, &wrap_value(&1)))
