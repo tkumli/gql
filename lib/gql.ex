@@ -238,6 +238,16 @@ defmodule GQL do
       }
       \"\"\"
 
+  Field arguments can be compound datastructures:
+
+      iex> GQL.new(field: {:hello, args: %{where: %{id: 42}, indices: [4,7,8]}})
+      ...> |> to_string()
+      \"\"\"
+      query {
+        hello(where: { id: 42 }, indices: [4, 7, 8])
+      }
+      \"\"\"
+
   """
   def new(opts \\ []) do
     Enum.reduce(opts, @base, fn {function, arg}, doc ->
@@ -633,17 +643,25 @@ defmodule GQL do
       :get_and_update, data, next when is_list(data) ->
         case Enum.find_index(data, &match_field(&1, name)) do
           nil ->
-            case next.(default_field) do
-              {get, updated_field} -> {get, data ++ [updated_field]}
-              :pop -> {default_field, data}
-            end
+            handle_field_creation(data, default_field, next)
 
           index ->
-            case next.(Enum.at(data, index)) do
-              {get, updated_field} -> {get, List.replace_at(data, index, updated_field)}
-              :pop -> {Enum.at(data, index), List.delete_at(data, index)}
-            end
+            handle_field_update(data, index, next)
         end
+    end
+  end
+
+  defp handle_field_creation(data, default_field, next) do
+    case next.(default_field) do
+      {get, updated_field} -> {get, data ++ [updated_field]}
+      :pop -> {default_field, data}
+    end
+  end
+
+  defp handle_field_update(data, index, next) do
+    case next.(Enum.at(data, index)) do
+      {get, updated_field} -> {get, List.replace_at(data, index, updated_field)}
+      :pop -> {Enum.at(data, index), List.delete_at(data, index)}
     end
   end
 
@@ -734,19 +752,19 @@ defmodule GQL do
     optic = build_field_optic(path, :selections)
 
     update_in(doc, optic, fn selections ->
-      Enum.map(selections || [], fn
-        %Field{} = field ->
-          if match_field(field, name) do
-            %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
-          else
-            field
-          end
-
-        other ->
-          other
-      end)
+      Enum.map(selections || [], &replace_field_if_match(&1, name, alias_name, args))
     end)
   end
+
+  defp replace_field_if_match(%Field{} = field, name, alias_name, args) do
+    if match_field(field, name) do
+      %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
+    else
+      field
+    end
+  end
+
+  defp replace_field_if_match(other, _name, _alias_name, _args), do: other
 
   @doc """
   Removes a field and all of its associated sub-selections from the document.
@@ -1665,39 +1683,43 @@ defmodule GQL do
 
           index ->
             # We've seen this field before, merge subfields
-            existing_field = Enum.at(acc, index)
-
-            # Collect all subfield selections
-            existing_subfields =
-              case existing_field.selection_set do
-                nil -> []
-                %{selections: selections} -> selections
-              end
-
-            new_subfields =
-              case field.selection_set do
-                nil -> []
-                %{selections: selections} -> selections
-              end
-
-            # Recursively deduplicate the merged subfields
-            merged_subfields = deduplicate_fields(existing_subfields ++ new_subfields)
-
-            # Update the field at the original position
-            updated_field =
-              case merged_subfields do
-                [] ->
-                  existing_field
-
-                _ ->
-                  %{existing_field | selection_set: %SelectionSet{selections: merged_subfields}}
-              end
-
-            {List.replace_at(acc, index, updated_field), seen}
+            {merge_duplicate_field(acc, index, field), seen}
         end
       end)
 
     result
+  end
+
+  defp merge_duplicate_field(acc, index, field) do
+    existing_field = Enum.at(acc, index)
+
+    # Collect all subfield selections
+    existing_subfields =
+      case existing_field.selection_set do
+        nil -> []
+        %{selections: selections} -> selections
+      end
+
+    new_subfields =
+      case field.selection_set do
+        nil -> []
+        %{selections: selections} -> selections
+      end
+
+    # Recursively deduplicate the merged subfields
+    merged_subfields = deduplicate_fields(existing_subfields ++ new_subfields)
+
+    # Update the field at the original position
+    updated_field =
+      case merged_subfields do
+        [] ->
+          existing_field
+
+        _ ->
+          %{existing_field | selection_set: %SelectionSet{selections: merged_subfields}}
+      end
+
+    List.replace_at(acc, index, updated_field)
   end
 
   defp wrap_value(nil), do: {nil, nil}
@@ -1848,25 +1870,26 @@ defmodule GQL do
 
   defp _paths(%SelectionSet{selections: selections}) do
     nested_paths =
-      for selection <- selections do
-        case selection do
-          # Only process Field selections that have a selection_set
-          %Field{selection_set: selection_set} when not is_nil(selection_set) ->
-            identifier = field_identifier(selection)
-
-            for path <- _paths(selection_set) do
-              [identifier | path]
-            end
-
-          _ ->
-            # Skip InlineFragments, FragmentSpreads, and fields without selection sets
-            # Inline fragments are not navigable by field paths, so we can't inject into them
-            []
-        end
-      end
+      selections
+      |> Enum.map(&selection_to_paths/1)
       |> Enum.flat_map(& &1)
 
     [[] | nested_paths]
+  end
+
+  defp selection_to_paths(%Field{selection_set: selection_set} = selection)
+       when not is_nil(selection_set) do
+    identifier = field_identifier(selection)
+
+    for path <- _paths(selection_set) do
+      [identifier | path]
+    end
+  end
+
+  defp selection_to_paths(_selection) do
+    # Skip InlineFragments, FragmentSpreads, and fields without selection sets
+    # Inline fragments are not navigable by field paths, so we can't inject into them
+    []
   end
 end
 

@@ -11,6 +11,13 @@ defmodule GQL.MixProject do
       description: description(),
       package: package(),
       source_url: "https://github.com/bsanyi/gql",
+      test_coverage: [tool: ExCoveralls],
+      preferred_cli_env: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.post": :test,
+        "coveralls.html": :test
+      ],
       docs: [
         main: "readme",
         extras: ["README.md"]
@@ -41,6 +48,8 @@ defmodule GQL.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:excoveralls, "~> 0.18.5", only: :test, runtime: false},
+      {:castore, "~> 1.0", only: :test, runtime: false},
       {:credo, "~> 1.7", only: :dev, runtime: false},
       {:ex_doc, "~> 0.40.0", only: :dev, runtime: false},
       {:makeup_graphql, ">= 0.0.0", only: :dev, runtime: false},
