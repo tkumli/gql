@@ -4,7 +4,7 @@ defmodule GQL.MixProject do
   def project do
     [
       app: :gql,
-      version: "0.2.0",
+      version: "0.2.1",
       elixir: "~> 1.17 or ~> 1.18 or ~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -41,6 +41,7 @@ defmodule GQL.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:credo, "~> 1.7", only: :dev, runtime: false},
       {:ex_doc, "~> 0.40.0", only: :dev, runtime: false},
       {:makeup_graphql, ">= 0.0.0", only: :dev, runtime: false},
       {:absinthe, ">= 1.9.0"}

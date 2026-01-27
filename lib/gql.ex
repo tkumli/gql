@@ -142,11 +142,17 @@ defmodule GQL do
       \"\"\"
 
   """
-  def sigil_GQL(graphql, opts) do
-    case Absinthe.Sigil.sigil_GQL(graphql, opts) do
-      {:error, _} = error -> error
-      str -> parse(str)
+  Code.ensure_loaded(Absinthe.Sigil)
+
+  if Kernel.function_exported?(Absinthe.Sigil, :sigil_GQL, 2) do
+    def sigil_GQL(graphql, opts) do
+      case Absinthe.Sigil.sigil_GQL(graphql, opts) do
+        {:error, _} = error -> error
+        str -> parse(str)
+      end
     end
+  else
+    IO.warn("Please upgrade Absinthe to `>= 1.9.0` in ordert to ~GQL to work.")
   end
 
   @doc """
@@ -307,14 +313,7 @@ defmodule GQL do
   """
   def type(doc, type) when is_operation(type) do
     doc = parse(doc)
-
-    %{
-      doc
-      | definitions:
-          for definition <- doc.definitions do
-            %{definition | operation: type}
-          end
-    }
+    update_operation_definitions(doc, &%{&1 | operation: type})
   end
 
   @doc """
@@ -331,14 +330,7 @@ defmodule GQL do
   def name(doc, name) do
     doc = parse(doc)
     name = to_string(name)
-
-    %{
-      doc
-      | definitions:
-          for definition <- doc.definitions do
-            %{definition | name: name}
-          end
-    }
+    update_operation_definitions(doc, &%{&1 | name: name})
   end
 
   @doc """
@@ -410,20 +402,13 @@ defmodule GQL do
     doc = parse(doc)
     name = to_string(name)
 
-    %{
-      doc
-      | definitions:
-          for definition <- doc.definitions do
-            %{
-              definition
-              | variable_definitions:
-                  Enum.reject(
-                    definition.variable_definitions,
-                    &match?(%{variable: %{name: ^name}}, &1)
-                  )
-            }
-          end
-    }
+    update_operation_definitions(doc, fn definition ->
+      %{
+        definition
+        | variable_definitions:
+            Enum.reject(definition.variable_definitions, &match?(%{variable: %{name: ^name}}, &1))
+      }
+    end)
   end
 
   @doc """
@@ -526,48 +511,15 @@ defmodule GQL do
 
     field = %Field{name: name, alias: alias && to_string(alias), arguments: arguments(args)}
 
-    # Check if the first path element is a fragment name
-    {target_filter, field_path} =
-      case path do
-        [first | rest] ->
-          first_str = to_string(first)
-          # Check if this matches a fragment definition
-          has_fragment =
-            Enum.any?(doc.definitions, fn
-              %Fragment{name: ^first_str} -> true
-              _ -> false
-            end)
+    {target_filter, field_path} = resolve_path_target(doc, path)
 
-          if has_fragment do
-            # Target only this fragment, and don't navigate into it as a field
-            {Access.filter(&match?(%Fragment{name: ^first_str}, &1)), rest}
-          else
-            # Target only operation definitions, use full path
-            {Access.filter(&match?(%OperationDefinition{}, &1)), path}
-          end
-
-        [] ->
-          # No path, target operation definitions
-          {Access.filter(&match?(%OperationDefinition{}, &1)), []}
-      end
-
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        target_filter,
-        for path_element <- field_path do
-          build_path_navigation(path_element)
-        end,
-        access_key(:selection_set, nil, %SelectionSet{}),
-        Access.key(:selections, [])
-      ]
-      |> List.flatten()
+    optic = build_navigation_optic(target_filter, field_path)
 
     doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [field] end)
 
     # Add subfields if the fields option is present
-    field_identifier = alias || name
-    subfield_path = path ++ [field_identifier]
+    identifier = field_identifier(%{alias: alias, name: name})
+    subfield_path = path ++ [identifier]
 
     Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
       add_subfield(acc_doc, subfield_def, subfield_path)
@@ -587,6 +539,28 @@ defmodule GQL do
     field(doc, subfield_name, Keyword.put(subfield_opts, :path, path))
   end
 
+  # Helper to resolve path into target filter and field path
+  defp resolve_path_target(doc, path) do
+    case path do
+      [first | rest] ->
+        first_str = to_string(first)
+        has_fragment =
+          Enum.any?(doc.definitions, fn
+            %Fragment{name: ^first_str} -> true
+            _ -> false
+          end)
+
+        if has_fragment do
+          {Access.filter(&match?(%Fragment{name: ^first_str}, &1)), rest}
+        else
+          {Access.filter(&match?(%OperationDefinition{}, &1)), path}
+        end
+
+      [] ->
+        {Access.filter(&match?(%OperationDefinition{}, &1)), []}
+    end
+  end
+
   # Parse path element into normalized {name, alias, args} tuple or inline fragment specification
   defp parse_path_element({nil, opts}) when is_list(opts) do
     {:inline_fragment, Keyword.get(opts, :type)}
@@ -598,6 +572,20 @@ defmodule GQL do
 
   defp parse_path_element(name) do
     {to_string(name), nil, []}
+  end
+
+  # Helper to build navigation optic from target filter and field path
+  defp build_navigation_optic(target_filter, field_path) do
+    [
+      access_key(:definitions, nil, []),
+      target_filter,
+      for path_element <- field_path do
+        build_path_navigation(path_element)
+      end,
+      access_key(:selection_set, nil, %SelectionSet{}),
+      Access.key(:selections, [])
+    ]
+    |> List.flatten()
   end
 
   # Helper to build navigation for a single path element
@@ -617,7 +605,12 @@ defmodule GQL do
 
   defp build_path_navigation(path_element) do
     {name, alias_name, args} = parse_path_element(path_element)
-    field = %Field{name: name, alias: alias_name && to_string(alias_name), arguments: arguments(args)}
+
+    field = %Field{
+      name: name,
+      alias: alias_name && to_string(alias_name),
+      arguments: arguments(args)
+    }
 
     [
       access_key(:selection_set, nil, %SelectionSet{}),
@@ -653,6 +646,13 @@ defmodule GQL do
         end
     end
   end
+
+  # Helper to get field identifier (alias or name)
+  defp field_identifier(%{alias: alias_val, name: _name_val}) when not is_nil(alias_val),
+    do: alias_val
+
+  defp field_identifier(%{name: name_val}), do: name_val
+  defp field_identifier(_), do: nil
 
   defp match_field(%Field{} = f, name) do
     # If the field has an alias, only match on alias
@@ -736,10 +736,7 @@ defmodule GQL do
     update_in(doc, optic, fn selections ->
       Enum.map(selections || [], fn
         %Field{} = field ->
-          # If field has an alias, only match on alias; otherwise match on name
-          matches = if field.alias, do: field.alias == name, else: field.name == name
-
-          if matches do
+          if match_field(field, name) do
             %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
           else
             field
@@ -776,12 +773,7 @@ defmodule GQL do
     optic = build_field_optic(path, :selections)
 
     update_in(doc, optic, fn selections ->
-      Enum.reject(selections || [], fn selection ->
-        alias_val = Map.get(selection, :alias)
-        name_val = Map.get(selection, :name)
-        # If has alias, only match on alias; otherwise match on name
-        if alias_val, do: alias_val == name, else: name_val == name
-      end)
+      Enum.reject(selections || [], &match_field(&1, name))
     end)
   end
 
@@ -945,19 +937,9 @@ defmodule GQL do
     case path do
       [] ->
         # Empty path means add directive to the operation itself
-        %{
-          doc
-          | definitions:
-              for definition <- doc.definitions do
-                case definition do
-                  %OperationDefinition{} = op_def ->
-                    %{op_def | directives: (op_def.directives || []) ++ [directive]}
-
-                  other ->
-                    other
-                end
-              end
-        }
+        update_operation_definitions(doc, fn op_def ->
+          %{op_def | directives: (op_def.directives || []) ++ [directive]}
+        end)
 
       _ ->
         # Non-empty path means add directive to a field
@@ -1060,6 +1042,25 @@ defmodule GQL do
       }
       \"\"\"
 
+  The `type` option can also be omitted entirely for grouping fields:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:user)
+      ...> |> #{@gql}.field(:id, path: [:user])
+      ...> |> #{@gql}.fragment(path: [:user], fields: [:name, :email])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        user {
+          id
+          ... {
+            name
+            email
+          }
+        }
+      }
+      \"\"\"
+
   The `fields` option allows you to specify subfields directly within the inline fragment:
 
       iex> #{@gql}.new()
@@ -1134,7 +1135,11 @@ defmodule GQL do
         }
 
         optic = build_field_optic(path, :selections)
-        doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
+
+        doc =
+          update_in(doc, optic, fn selection_list ->
+            (selection_list || []) ++ [inline_fragment]
+          end)
 
         subfield_path = path ++ [{nil, type: type}]
 
@@ -1270,42 +1275,8 @@ defmodule GQL do
       directives: []
     }
 
-    # Check if the first path element is a fragment name
-    {target_filter, field_path} =
-      case path do
-        [first | rest] ->
-          first_str = to_string(first)
-          # Check if this matches a fragment definition
-          has_fragment =
-            Enum.any?(doc.definitions, fn
-              %Fragment{name: ^first_str} -> true
-              _ -> false
-            end)
-
-          if has_fragment do
-            # Target only this fragment, and don't navigate into it as a field
-            {Access.filter(&match?(%Fragment{name: ^first_str}, &1)), rest}
-          else
-            # Target only operation definitions, use full path
-            {Access.filter(&match?(%OperationDefinition{}, &1)), path}
-          end
-
-        [] ->
-          # No path, target operation definitions
-          {Access.filter(&match?(%OperationDefinition{}, &1)), []}
-      end
-
-    optic =
-      [
-        access_key(:definitions, nil, []),
-        target_filter,
-        for path_element <- field_path do
-          build_path_navigation(path_element)
-        end,
-        access_key(:selection_set, nil, %SelectionSet{}),
-        Access.key(:selections, [])
-      ]
-      |> List.flatten()
+    {target_filter, field_path} = resolve_path_target(doc, path)
+    optic = build_navigation_optic(target_filter, field_path)
 
     update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [fragment_spread] end)
   end
@@ -1462,7 +1433,16 @@ defmodule GQL do
 
   """
   def inject_typenames(doc) do
-    for path <- paths(doc), reduce: doc do
+    doc = parse(doc)
+
+    # Inject typenames into operation definitions
+    doc =
+      for path <- operation_paths(doc), reduce: doc do
+        doc -> field(doc, "__typename", path: path)
+      end
+
+    # Inject typenames into fragment definitions
+    for path <- fragment_paths(doc), reduce: doc do
       doc -> field(doc, "__typename", path: path)
     end
   end
@@ -1586,6 +1566,20 @@ defmodule GQL do
 
   ### Helpers
 
+  # Helper to update operation definitions
+  defp update_operation_definitions(doc, fun) do
+    %{
+      doc
+      | definitions:
+          for definition <- doc.definitions do
+            case definition do
+              %OperationDefinition{} = op_def -> fun.(op_def)
+              other -> other
+            end
+          end
+    }
+  end
+
   # Build a common optic for navigating to a field property (arguments, directives, selections)
   defp build_field_optic(path, target_key) do
     [
@@ -1612,8 +1606,11 @@ defmodule GQL do
         ]
       end,
       case target_key do
-        :selections -> [access_key(:selection_set, nil, %SelectionSet{}), Access.key(:selections, [])]
-        _ -> Access.key(target_key, [])
+        :selections ->
+          [access_key(:selection_set, nil, %SelectionSet{}), Access.key(:selections, [])]
+
+        _ ->
+          Access.key(target_key, [])
       end
     ]
     |> List.flatten()
@@ -1652,14 +1649,14 @@ defmodule GQL do
     # We preserve order by processing fields left-to-right
     {result, _seen} =
       Enum.reduce(fields, {[], %{}}, fn field, {acc, seen} ->
-        field_identifier = Map.get(field, :alias) || Map.get(field, :name)
+        identifier = field_identifier(field)
 
         args_signature =
           field.arguments
           |> Enum.map(fn arg -> {arg.name, inspect(arg.value)} end)
           |> Enum.sort()
 
-        key = {field_identifier, args_signature}
+        key = {identifier, args_signature}
 
         case Map.get(seen, key) do
           nil ->
@@ -1713,12 +1710,14 @@ defmodule GQL do
   defp wrap_value("" <> string), do: {"String", %StringValue{value: string}}
 
   defp wrap_value(%{} = map) do
-    {nil, %ObjectValue{fields:
-      for {name, value} <- map do
-        {_, value} = wrap_value(value)
-        %ObjectField{name: to_string(name), value: value}
-      end
-    }}
+    {nil,
+     %ObjectValue{
+       fields:
+         for {name, value} <- map do
+           {_, value} = wrap_value(value)
+           %ObjectField{name: to_string(name), value: value}
+         end
+     }}
   end
 
   defp wrap_value(list) when is_list(list) do
@@ -1754,45 +1753,6 @@ defmodule GQL do
     end
   end
 
-  def all2(default) do
-    all = Access.all()
-
-    fn
-      op, [], next ->
-        all.(op, [default], next)
-
-      op, data, next ->
-        all.(op, data, next)
-    end
-  end
-
-  def all do
-    &all/3
-  end
-
-  defp all(:get, data, next) when is_list(data) do
-    Enum.map(data, next)
-  end
-
-  defp all(:get_and_update, data, next) when is_list(data) do
-    all(data, next, _gets = [], _updates = [])
-  end
-
-  defp all(_op, data, _next) do
-    raise "Access.all/0 expected a list, got: #{inspect(data)}"
-  end
-
-  defp all([head | rest], next, gets, updates) do
-    case next.(head) do
-      {get, update} -> all(rest, next, [get | gets], [update | updates])
-      :pop -> all(rest, next, [head | gets], updates)
-    end
-  end
-
-  defp all([], _next, gets, updates) do
-    {:lists.reverse(gets), :lists.reverse(updates)}
-  end
-
   defp substitute(value, src, dst) do
     if value == src, do: dst, else: value
   end
@@ -1802,21 +1762,13 @@ defmodule GQL do
     variable_name = to_string(variable)
     {_type, wrapped_value} = wrap_value(value)
 
-    %{
-      doc
-      | definitions:
-          for definition <- doc.definitions do
-            %{
-              definition
-              | selection_set:
-                  substitute_in_selection_set(
-                    definition.selection_set,
-                    variable_name,
-                    wrapped_value
-                  )
-            }
-          end
-    }
+    update_operation_definitions(doc, fn definition ->
+      %{
+        definition
+        | selection_set:
+            substitute_in_selection_set(definition.selection_set, variable_name, wrapped_value)
+      }
+    end)
   end
 
   defp substitute_in_selection_set(nil, _variable_name, _value), do: nil
@@ -1867,12 +1819,27 @@ defmodule GQL do
     end
   end
 
-  defp paths(doc) do
+  # Get all paths within operation definitions (queries, mutations, subscriptions)
+  defp operation_paths(doc) do
     doc = parse(doc)
 
     doc.definitions
+    |> Enum.filter(&match?(%OperationDefinition{}, &1))
     |> Enum.flat_map(fn definition ->
       _paths(definition.selection_set)
+    end)
+    |> Enum.uniq()
+  end
+
+  # Get all paths within fragment definitions
+  defp fragment_paths(doc) do
+    doc = parse(doc)
+
+    doc.definitions
+    |> Enum.filter(&match?(%Fragment{}, &1))
+    |> Enum.flat_map(fn %Fragment{name: name, selection_set: selection_set} ->
+      _paths(selection_set)
+      |> Enum.map(fn path -> [name | path] end)
     end)
     |> Enum.uniq()
   end
@@ -1881,19 +1848,26 @@ defmodule GQL do
 
   defp _paths(%SelectionSet{selections: selections}) do
     nested_paths =
-      for field <- selections, field.selection_set != nil do
-        field_name = Map.get(field, :alias) || Map.get(field, :name)
+      for selection <- selections do
+        case selection do
+          # Only process Field selections that have a selection_set
+          %Field{selection_set: selection_set} when not is_nil(selection_set) ->
+            identifier = field_identifier(selection)
 
-        for path <- _paths(field.selection_set) do
-          [field_name | path]
+            for path <- _paths(selection_set) do
+              [identifier | path]
+            end
+
+          _ ->
+            # Skip InlineFragments, FragmentSpreads, and fields without selection sets
+            # Inline fragments are not navigable by field paths, so we can't inject into them
+            []
         end
       end
-      |> flatten_just_one_level()
+      |> Enum.flat_map(& &1)
 
     [[] | nested_paths]
   end
-
-  defp flatten_just_one_level(list), do: Enum.flat_map(list, &Function.identity/1)
 end
 
 defimpl String.Chars, for: Document do
