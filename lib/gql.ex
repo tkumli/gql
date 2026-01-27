@@ -850,15 +850,47 @@ defmodule GQL do
   end
 
   @doc """
-  Adds a directive, such as @include or @skip, to a field at the specified path.
+  Adds a directive, such as @include or @skip, to a field or to the operation
+  itself at the specified path.
 
-  Directives are annotations that can be attached to fields to provide additional
-  metadata or modify execution behavior. Common directives include @include, @skip,
-  and @deprecated.
+  Directives are annotations that can be attached to fields or operations to
+  provide additional metadata or modify execution behavior. Common directives
+  include `@include`, `@skip`, and `@deprecated`.
+
+  To add a directive to the operation itself (the root
+  query/mutation/subscription), use an empty path `[]`. This allows you to
+  write queries like `query @directive { ... }`.
 
   ## Examples
 
-  Adding an @include directive with a condition:
+  Adding a directive to the operation itself (root):
+
+      iex> "query { user { name } }"
+      ...> |> #{@gql}.directive("cached", [])
+      ...> |> to_string()
+      \"\"\"
+      query @cached {
+        user {
+          name
+        }
+      }
+      \"\"\"
+
+  Adding a directive with arguments to the root operation:
+
+      iex> #{@gql}.new(field: :user)
+      ...> |> #{@gql}.field(:name, path: [:user])
+      ...> |> #{@gql}.directive("rateLimit", [], %{max: 100})
+      ...> |> to_string()
+      \"\"\"
+      query @rateLimit(max: 100) {
+        user {
+          name
+        }
+      }
+      \"\"\"
+
+  Adding an @include directive with a condition to a field:
 
       iex> "query { user { name email } }"
       ...> |> #{@gql}.directive("include", ["user"], %{if: "$showUser"})
@@ -906,17 +938,37 @@ defmodule GQL do
     name = to_string(name)
 
     directive = %Directive{name: name, arguments: arguments(directive_args)}
-    optic = build_field_optic(path, :directives)
 
-    update_in(doc, optic, fn directive_list -> (directive_list || []) ++ [directive] end)
+    case path do
+      [] ->
+        # Empty path means add directive to the operation itself
+        %{
+          doc
+          | definitions:
+              for definition <- doc.definitions do
+                case definition do
+                  %OperationDefinition{} = op_def ->
+                    %{op_def | directives: (op_def.directives || []) ++ [directive]}
+
+                  other ->
+                    other
+                end
+              end
+        }
+
+      _ ->
+        # Non-empty path means add directive to a field
+        optic = build_field_optic(path, :directives)
+        update_in(doc, optic, fn directive_list -> (directive_list || []) ++ [directive] end)
+    end
   end
 
   @doc """
   Defines a reusable named fragment on a specific GraphQL type.
 
-  Fragments allow you to define reusable sets of fields that can be spread across
-  multiple queries. This function creates an empty fragment definition that can later
-  be populated with fields.
+  Fragments allow you to define reusable sets of fields that can be spread
+  across multiple queries. This function creates an empty fragment definition
+  that can later be populated with fields.
 
   ## Examples
 
@@ -963,8 +1015,7 @@ defmodule GQL do
       name: to_string(name),
       type_condition: %NamedType{name: to_string(type)},
       directives: [],
-      selection_set: %SelectionSet{selections: []},
-      loc: %{line: nil}
+      selection_set: %SelectionSet{selections: []}
     }
 
     %{doc | definitions: doc.definitions ++ [fragment]}
@@ -1089,8 +1140,7 @@ defmodule GQL do
 
     fragment_spread = %FragmentSpread{
       name: name,
-      directives: [],
-      loc: %{line: nil}
+      directives: []
     }
 
     # Check if the first path element is a fragment name
@@ -1238,8 +1288,7 @@ defmodule GQL do
     inline_fragment = %InlineFragment{
       type_condition: type_condition,
       directives: [],
-      selection_set: %SelectionSet{selections: []},
-      loc: %{line: nil}
+      selection_set: %SelectionSet{selections: []}
     }
 
     optic = build_field_optic(path, :selections)
@@ -1254,10 +1303,123 @@ defmodule GQL do
 
   @doc """
   Inlines all fragment spreads into the main selection set for simplified document structure.
+
+  This function replaces all fragment spreads (`...FragmentName`) with the actual fields
+  from the fragment definition, then removes the fragment definitions from the document.
+  This is useful when you want to convert a document with named fragments into a single
+  inline query without separate fragment definitions.
+
+  ## Examples
+
+  Inlining a simple fragment:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.field(:name, path: [:UserFields])
+      ...> |> #{@gql}.field(:email, path: [:UserFields])
+      ...> |> #{@gql}.field(:user)
+      ...> |> #{@gql}.spread_fragment(:UserFields, path: [:user])
+      ...> |> #{@gql}.inline_fragments()
+      ...> |> to_string()
+      \"\"\"
+      query {
+        user {
+          name
+          email
+        }
+      }
+      \"\"\"
+
+  Inlining multiple fragments:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.fragment(:BasicInfo, :User)
+      ...> |> #{@gql}.field(:id, path: [:BasicInfo])
+      ...> |> #{@gql}.field(:name, path: [:BasicInfo])
+      ...> |> #{@gql}.fragment(:ContactInfo, :User)
+      ...> |> #{@gql}.field(:email, path: [:ContactInfo])
+      ...> |> #{@gql}.field(:phone, path: [:ContactInfo])
+      ...> |> #{@gql}.field(:user)
+      ...> |> #{@gql}.spread_fragment(:BasicInfo, path: [:user])
+      ...> |> #{@gql}.spread_fragment(:ContactInfo, path: [:user])
+      ...> |> #{@gql}.inline_fragments()
+      ...> |> to_string()
+      \"\"\"
+      query {
+        user {
+          id
+          name
+          email
+          phone
+        }
+      }
+      \"\"\"
+
   """
   def inline_fragments(doc) do
-    # let's call spread_fragment for all fragments
-    doc
+    doc = parse(doc)
+
+    # Build a map of fragment name -> fragment definition for quick lookup
+    fragment_map =
+      doc.definitions
+      |> Enum.filter(&match?(%Fragment{}, &1))
+      |> Map.new(fn %Fragment{name: name} = fragment -> {name, fragment} end)
+
+    # Process all operation definitions to replace fragment spreads
+    inlined_definitions =
+      for definition <- doc.definitions do
+        case definition do
+          %OperationDefinition{} = op_def ->
+            %{op_def | selection_set: inline_selection_set(op_def.selection_set, fragment_map)}
+
+          %Fragment{} ->
+            # Skip fragment definitions - they'll be removed
+            nil
+        end
+      end
+      |> Enum.reject(&is_nil/1)
+
+    %{doc | definitions: inlined_definitions}
+  end
+
+  # Recursively inline fragment spreads in a selection set
+  defp inline_selection_set(nil, _fragment_map), do: nil
+
+  defp inline_selection_set(%SelectionSet{selections: selections} = selection_set, fragment_map) do
+    inlined_selections =
+      selections
+      |> Enum.flat_map(fn
+        %FragmentSpread{name: name} ->
+          # Replace fragment spread with the fragment's selections
+          case Map.get(fragment_map, name) do
+            %Fragment{selection_set: fragment_selection_set} ->
+              # Recursively inline any nested fragment spreads
+              inlined_fragment_set = inline_selection_set(fragment_selection_set, fragment_map)
+              inlined_fragment_set.selections
+
+            nil ->
+              # Fragment not found, keep the spread as-is
+              [%FragmentSpread{name: name}]
+          end
+
+        %Field{selection_set: field_selection_set} = field ->
+          # Recursively process nested selections in fields
+          [%{field | selection_set: inline_selection_set(field_selection_set, fragment_map)}]
+
+        %InlineFragment{selection_set: inline_fragment_set} = inline_fragment ->
+          # Recursively process selections in inline fragments
+          [
+            %{
+              inline_fragment
+              | selection_set: inline_selection_set(inline_fragment_set, fragment_map)
+            }
+          ]
+
+        other ->
+          [other]
+      end)
+
+    %{selection_set | selections: inlined_selections}
   end
 
   @doc """
