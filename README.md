@@ -278,21 +278,21 @@ query {
 Build queries from reusable components:
 
 ```elixir
-def base_user_fields(query) do
+def base_user_fields(query, path) do
   query
-  |> GQL.field(:id)
-  |> GQL.field(:name)
+  |> GQL.field(:id, path: path)
+  |> GQL.field(:name, path: path)
 end
 
-def with_posts(query) do
+def with_posts(query, path) do
   query
-  |> GQL.field(:posts)
-  |> GQL.field(:title, path: [:posts])
+  |> GQL.field(:posts, path: path)
+  |> GQL.field(:title, path: List.wrap(path) ++ [:posts])
 end
 
 GQL.new(field: :user)
-|> base_user_fields()
-|> with_posts()
+|> base_user_fields("user")
+|> with_posts("user")
 ```
 
 This generates:

@@ -43,7 +43,7 @@ defmodule GQL.MixProject do
     [
       {:ex_doc, "~> 0.40.0", only: :dev, runtime: false},
       {:makeup_graphql, ">= 0.0.0", only: :dev, runtime: false},
-      {:absinthe, ">= 0.0.0"}
+      {:absinthe, ">= 1.9.0"}
     ]
   end
 end

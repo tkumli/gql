@@ -37,8 +37,8 @@ defmodule GQL do
       \"\"\"
       query contact {
         user {
-          email
           name
+          email
         }
       }
       \"\"\"
@@ -66,12 +66,12 @@ defmodule GQL do
   The result is
 
       query {
+        user
+        id
+        name
         posts {
           title
         }
-        name
-        id
-        user
       }
 
   This composable approach allows you to build complex queries from simple,
@@ -109,8 +109,8 @@ defmodule GQL do
 
       subscription {
         user(id: 19) {
-          mailbox_size
           id
+          mailbox_size
         }
       }
 
@@ -193,8 +193,8 @@ defmodule GQL do
       \"\"\"
       query {
         p: posts(id: 42) {
-          a: author
           t: title
+          a: author
         }
       }
       \"\"\"
@@ -320,9 +320,9 @@ defmodule GQL do
       ...> |> #{@gql}.field(:set_key, args: [key: "$key", value: "hello"])
       ...> |> to_string()
       \"\"\"
-      mutation Mutation($age: Integer! = 42, $name: String! = "Joe", $key: Integer!, $id: ID) {
-        set_key(key: $key, value: "hello")
+      mutation Mutation($id: ID, $key: Integer!, $name: String! = "Joe", $age: Integer! = 42) {
         add_user(id: $id, name: $name, age: $age)
+        set_key(key: $key, value: "hello")
       }
       \"\"\"
 
@@ -340,14 +340,15 @@ defmodule GQL do
           for definition <- doc.definitions do
             %{
               definition
-              | variable_definitions: [
-                  %VariableDefinition{
-                    variable: %Variable{name: to_string(name)},
-                    type: if(optional, do: type, else: %NonNullType{type: type}),
-                    default_value: default
-                  }
-                  | definition.variable_definitions
-                ],
+              | variable_definitions:
+                  definition.variable_definitions ++
+                    [
+                      %VariableDefinition{
+                        variable: %Variable{name: to_string(name)},
+                        type: if(optional, do: type, else: %NonNullType{type: type}),
+                        default_value: default
+                      }
+                    ],
                 name: definition.name || String.capitalize(to_string(definition.operation))
             }
           end
@@ -396,8 +397,8 @@ defmodule GQL do
 
       iex> "query { __typename }" |> #{@gql}.field(:id) |> to_string()
       "query {
-        id
         __typename
+        id
       }
       "
 
@@ -431,8 +432,8 @@ defmodule GQL do
         x
       }
       fragment UserFields on User {
-        email
         name
+        email
       }
       \"\"\"
 
@@ -483,7 +484,7 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn selection_list -> [field | selection_list || []] end)
+    update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [field] end)
   end
 
   # Helper to build navigation for a single path element
@@ -520,11 +521,8 @@ defmodule GQL do
 
     [
       access_key(:selection_set, nil, %SelectionSet{}),
-      access_key(:selections, [], [field]),
-      Access.filter(fn
-        %Field{} = f -> f.alias == name || f.name == name
-        _ -> false
-      end)
+      access_key(:selections, nil, []),
+      access_or_create_field(name, field)
     ]
   end
 
@@ -534,13 +532,57 @@ defmodule GQL do
 
     [
       access_key(:selection_set, nil, %SelectionSet{}),
-      access_key(:selections, [], [field]),
-      Access.filter(fn
-        %Field{} = f -> f.alias == name || f.name == name
-        _ -> false
-      end)
+      access_key(:selections, nil, []),
+      access_or_create_field(name, field)
     ]
   end
+
+  # Custom access function that creates a field if it doesn't exist
+  defp access_or_create_field(name, default_field) do
+    fn
+      :get, data, next when is_list(data) ->
+        # Find matching field
+        case Enum.find(data, &match_field(&1, name)) do
+          nil ->
+            # Field doesn't exist, return the default
+            next.(default_field)
+
+          field ->
+            next.(field)
+        end
+
+      :get_and_update, data, next when is_list(data) ->
+        # Find matching field
+        case Enum.find_index(data, &match_field(&1, name)) do
+          nil ->
+            # Field doesn't exist, create it
+            case next.(default_field) do
+              {get, updated_field} ->
+                # Insert the new field at the end
+                {get, data ++ [updated_field]}
+
+              :pop ->
+                # Don't insert anything
+                {default_field, data}
+            end
+
+          index ->
+            # Field exists, update it
+            field = Enum.at(data, index)
+
+            case next.(field) do
+              {get, updated_field} ->
+                {get, List.replace_at(data, index, updated_field)}
+
+              :pop ->
+                {field, List.delete_at(data, index)}
+            end
+        end
+    end
+  end
+
+  defp match_field(%Field{} = f, name), do: f.alias == name || f.name == name
+  defp match_field(_, _), do: false
 
   @doc """
   Attaches an argument to a field identified by its path.
@@ -594,7 +636,7 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn argument_list -> [argument | argument_list || []] end)
+    update_in(doc, optic, fn argument_list -> (argument_list || []) ++ [argument] end)
   end
 
   @doc """
@@ -677,10 +719,8 @@ defmodule GQL do
       Enum.map(selections || [], fn
         %Field{} = field when field.name == name or field.alias == name ->
           # Update the field while preserving its selection_set
-          %{field |
-            alias: alias_name && to_string(alias_name),
-            arguments: arguments(args)
-          }
+          %{field | alias: alias_name && to_string(alias_name), arguments: arguments(args)}
+
         other ->
           other
       end)
@@ -770,7 +810,7 @@ defmodule GQL do
       ...> |> to_string()
       \"\"\"
       query {
-        posts(published: false, limit: 20) {
+        posts(limit: 20, published: false) {
           title
         }
       }
@@ -931,7 +971,7 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn directive_list -> [directive | directive_list || []] end)
+    update_in(doc, optic, fn directive_list -> (directive_list || []) ++ [directive] end)
   end
 
   @doc """
@@ -1075,8 +1115,8 @@ defmodule GQL do
         }
       }
       fragment UserFields on User {
-        email
         name
+        email
       }
       \"\"\"
 
@@ -1099,8 +1139,8 @@ defmodule GQL do
         }
       }
       fragment ContactInfo on User {
-        phone
         email
+        phone
       }
       \"\"\"
 
@@ -1153,7 +1193,7 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn selection_list -> [fragment_spread | selection_list || []] end)
+    update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [fragment_spread] end)
   end
 
   @doc """
@@ -1179,13 +1219,13 @@ defmodule GQL do
       \"\"\"
       query {
         search(term: "elixir") {
-          ... on Post {
-            content
-            title
-          }
           ... on User {
-            email
             name
+            email
+          }
+          ... on Post {
+            title
+            content
           }
         }
       }
@@ -1202,10 +1242,10 @@ defmodule GQL do
       \"\"\"
       query {
         node(id: "123") {
+          id
           ... {
             __typename
           }
-          id
         }
       }
       \"\"\"
@@ -1260,7 +1300,7 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn selection_list -> [inline_fragment | selection_list || []] end)
+    update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
   end
 
   @doc """
@@ -1288,15 +1328,15 @@ defmodule GQL do
     ...> |> to_string()
     \"\"\"
     query {
-      __typename
       apple {
-        __typename
         foo
         bar {
-          __typename
           baz
+          __typename
         }
+        __typename
       }
+      __typename
     }
     \"\"\"
 
@@ -1590,7 +1630,6 @@ defmodule GQL do
   defp all([], _next, gets, updates) do
     {:lists.reverse(gets), :lists.reverse(updates)}
   end
-
 
   defp substitute(value, src, dst) do
     if value == src, do: dst, else: value
