@@ -199,6 +199,37 @@ defmodule GQL do
       }
       \"\"\"
 
+  The `fields` option allows nested field definitions:
+
+      iex> #{@gql}.new(field: {:posts, fields: [:title, {:author, fields: [:name, :email]}]}) |> to_string()
+      \"\"\"
+      query {
+        posts {
+          title
+          author {
+            name
+            email
+          }
+        }
+      }
+      \"\"\"
+
+  Inline fragments can also be added with the `fields` option:
+
+      iex> #{@gql}.new(
+      ...>   field: :x,
+      ...>   inline_fragment: {:Author, path: "x", fields: [:name, {:email, alias: "mail"}]}) |> to_string()
+      \"\"\"
+      query {
+        x {
+          ... on Author {
+            name
+            mail: email
+          }
+        }
+      }
+      \"\"\"
+
   """
   def new(opts \\ []) do
     Enum.reduce(opts, @base, fn {function, arg}, doc ->
@@ -437,6 +468,50 @@ defmodule GQL do
       }
       \"\"\"
 
+  The `fields` option allows you to specify subfields directly:
+
+      iex> import #{@gql}
+      iex> new() |> field(:foo, fields: [:bar, :baz]) |> to_string()
+      \"\"\"
+      query {
+        foo {
+          bar
+          baz
+        }
+      }
+      \"\"\"
+
+  Subfield definitions support the same options as the main field definition,
+  including `alias` and `args`:
+
+      iex> import #{@gql}
+      iex> new() |> field(:user, fields: [:id, {:name, alias: "fullName"}]) |> to_string()
+      \"\"\"
+      query {
+        user {
+          id
+          fullName: name
+        }
+      }
+      \"\"\"
+
+      iex> import #{@gql}
+      iex> new() |> field(:users, fields: [{:user, args: %{id: 42}, alias: "u"}, :name]) |> to_string()
+      \"\"\"
+      query {
+        users {
+          u: user(id: 42)
+          name
+        }
+      }
+      \"\"\"
+
+  The `path` option is not allowed in subfield definitions:
+
+      iex> import #{@gql}
+      iex> new() |> field(:foo, fields: [{:bar, path: [:baz]}])
+      ** (ArgumentError) the `path` option is not allowed in subfield definitions
+
   """
   def field(doc, name, opts \\ []) do
     doc = parse(doc)
@@ -444,6 +519,7 @@ defmodule GQL do
     alias = Keyword.get(opts, :alias)
     path = Keyword.get(opts, :path, []) |> List.wrap()
     args = Keyword.get(opts, :args, [])
+    subfields = Keyword.get(opts, :fields, [])
 
     field = %Field{name: name, alias: alias && to_string(alias), arguments: arguments(args)}
 
@@ -484,7 +560,29 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [field] end)
+    doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [field] end)
+
+    # Add subfields if the fields option is present
+    field_identifier = alias || name
+    subfield_path = path ++ [field_identifier]
+
+    Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
+      add_subfield(acc_doc, subfield_def, subfield_path)
+    end)
+  end
+
+  # Helper function to add a single subfield
+  defp add_subfield(doc, subfield_name, path) when is_atom(subfield_name) do
+    field(doc, subfield_name, path: path)
+  end
+
+  defp add_subfield(doc, {subfield_name, subfield_opts}, path) when is_list(subfield_opts) do
+    # Validate that path option is not present
+    if Keyword.has_key?(subfield_opts, :path) do
+      raise ArgumentError, "the `path` option is not allowed in subfield definitions"
+    end
+
+    field(doc, subfield_name, Keyword.put(subfield_opts, :path, path))
   end
 
   # Helper to build navigation for a single path element
@@ -1250,10 +1348,51 @@ defmodule GQL do
       }
       \"\"\"
 
+  The `fields` option allows you to specify subfields directly within the inline fragment:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:search, args: %{term: "elixir"})
+      ...> |> #{@gql}.inline_fragment(:User, path: [:search], fields: [:name, :email])
+      ...> |> #{@gql}.inline_fragment(:Post, path: [:search], fields: [:title, :content])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        search(term: "elixir") {
+          ... on User {
+            name
+            email
+          }
+          ... on Post {
+            title
+            content
+          }
+        }
+      }
+      \"\"\"
+
+  Subfield definitions support the same options as the main field definition,
+  including `alias` and `args`:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:search)
+      ...> |> #{@gql}.inline_fragment(:User, path: [:search], fields: [:id, {:name, alias: "fullName"}])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        search {
+          ... on User {
+            id
+            fullName: name
+          }
+        }
+      }
+      \"\"\"
+
   """
   def inline_fragment(doc, type, opts \\ []) do
     doc = parse(doc)
     path = Keyword.get(opts, :path, []) |> List.wrap()
+    subfields = Keyword.get(opts, :fields, [])
 
     type_condition =
       if type do
@@ -1300,7 +1439,14 @@ defmodule GQL do
       ]
       |> List.flatten()
 
-    update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
+    doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
+
+    # Add subfields if the fields option is present
+    subfield_path = path ++ [{nil, type: type}]
+
+    Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
+      add_subfield(acc_doc, subfield_def, subfield_path)
+    end)
   end
 
   @doc """
