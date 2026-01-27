@@ -218,7 +218,7 @@ defmodule GQL do
 
       iex> #{@gql}.new(
       ...>   field: :x,
-      ...>   inline_fragment: {:Author, path: "x", fields: [:name, {:email, alias: "mail"}]}) |> to_string()
+      ...>   fragment: [type: :Author, path: "x", fields: [:name, {:email, alias: "mail"}]]) |> to_string()
       \"\"\"
       query {
         x {
@@ -236,6 +236,7 @@ defmodule GQL do
       args =
         cond do
           is_tuple(arg) -> Tuple.to_list(arg)
+          is_list(arg) and Keyword.keyword?(arg) -> [arg]
           is_list(arg) -> arg
           true -> List.wrap(arg)
         end
@@ -454,7 +455,7 @@ defmodule GQL do
       iex> import #{@gql}
       iex> new()
       ...> |> field(:x)
-      ...> |> fragment(:UserFields, :User)
+      ...> |> fragment(name: :UserFields, type: :User)
       ...> |> field(:name, path: [:UserFields])
       ...> |> field(:email, path: [:UserFields])
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
@@ -964,18 +965,21 @@ defmodule GQL do
   end
 
   @doc """
-  Defines a reusable named fragment on a specific GraphQL type.
+  Creates either a named fragment definition or adds an inline fragment to a selection set.
 
-  Fragments allow you to define reusable sets of fields that can be spread
-  across multiple queries. This function creates an empty fragment definition
-  that can later be populated with fields.
+  This function has two modes of operation based on the options provided:
 
-  ## Examples
+  - **Named fragments** (when `name` and `type` are provided): Creates a reusable fragment
+    definition that can be spread across multiple queries using `spread_fragment/3`.
+  - **Inline fragments** (when `path` and `type` are provided): Adds an inline fragment
+    for handling union or interface types at a specific path.
 
-  Creating a basic fragment on a User type:
+  ## Named Fragment Examples
+
+  Creating a basic named fragment on a User type:
 
       iex> #{@gql}.new(field: "x")
-      ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.fragment(name: :UserFields, type: :User)
       ...> |> #{@gql}.field("y", path: [:UserFields])
       ...> |> to_string() |> String.replace("\\n\\n", "\\n")
       \"\"\"
@@ -987,11 +991,11 @@ defmodule GQL do
       }
       \"\"\"
 
-  Creating multiple fragments:
+  Creating multiple named fragments:
 
       iex> #{@gql}.new(field: "x")
-      ...> |> #{@gql}.fragment(:BasicUser, :User)
-      ...> |> #{@gql}.fragment(:PostInfo, :Post)
+      ...> |> #{@gql}.fragment(name: :BasicUser, type: :User)
+      ...> |> #{@gql}.fragment(name: :PostInfo, type: :Post)
       ...> |> #{@gql}.field("y", path: :BasicUser)
       ...> |> #{@gql}.field("z", path: :PostInfo)
       ...> |> to_string() |> String.replace("\\n\\n", "\\n")
@@ -1007,18 +1011,139 @@ defmodule GQL do
       }
       \"\"\"
 
+  ## Inline Fragment Examples
+
+  Adding an inline fragment to handle a union type:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:search, args: %{term: "elixir"})
+      ...> |> #{@gql}.fragment(type: :User, path: [:search])
+      ...> |> #{@gql}.field(:name, path: [:search, {nil, type: :User}])
+      ...> |> #{@gql}.field(:email, path: [:search, {nil, type: :User}])
+      ...> |> #{@gql}.fragment(type: :Post, path: [:search])
+      ...> |> #{@gql}.field(:title, path: [:search, {nil, type: :Post}])
+      ...> |> #{@gql}.field(:content, path: [:search, {nil, type: :Post}])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        search(term: "elixir") {
+          ... on User {
+            name
+            email
+          }
+          ... on Post {
+            title
+            content
+          }
+        }
+      }
+      \"\"\"
+
+  Adding an inline fragment without a type condition (for interfaces):
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:node, args: %{id: "123"})
+      ...> |> #{@gql}.field(:id, path: [:node])
+      ...> |> #{@gql}.fragment(type: nil, path: [:node])
+      ...> |> #{@gql}.field(:__typename, path: [:node, {nil, type: nil}])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        node(id: "123") {
+          id
+          ... {
+            __typename
+          }
+        }
+      }
+      \"\"\"
+
+  The `fields` option allows you to specify subfields directly within the inline fragment:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:search, args: %{term: "elixir"})
+      ...> |> #{@gql}.fragment(type: :User, path: [:search], fields: [:name, :email])
+      ...> |> #{@gql}.fragment(type: :Post, path: [:search], fields: [:title, :content])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        search(term: "elixir") {
+          ... on User {
+            name
+            email
+          }
+          ... on Post {
+            title
+            content
+          }
+        }
+      }
+      \"\"\"
+
+  Subfield definitions support the same options as the main field definition,
+  including `alias` and `args`:
+
+      iex> #{@gql}.new()
+      ...> |> #{@gql}.field(:search)
+      ...> |> #{@gql}.fragment(type: :User, path: [:search], fields: [:id, {:name, alias: "fullName"}])
+      ...> |> to_string()
+      \"\"\"
+      query {
+        search {
+          ... on User {
+            id
+            fullName: name
+          }
+        }
+      }
+      \"\"\"
+
   """
-  def fragment(doc, name, type) do
+  def fragment(doc, opts \\ []) do
     doc = parse(doc)
 
-    fragment = %Fragment{
-      name: to_string(name),
-      type_condition: %NamedType{name: to_string(type)},
-      directives: [],
-      selection_set: %SelectionSet{selections: []}
-    }
+    cond do
+      # Named fragment mode: name and type are provided
+      Keyword.has_key?(opts, :name) ->
+        name = Keyword.fetch!(opts, :name)
+        type = Keyword.fetch!(opts, :type)
 
-    %{doc | definitions: doc.definitions ++ [fragment]}
+        fragment = %Fragment{
+          name: to_string(name),
+          type_condition: %NamedType{name: to_string(type)},
+          directives: [],
+          selection_set: %SelectionSet{selections: []}
+        }
+
+        %{doc | definitions: doc.definitions ++ [fragment]}
+
+      # Inline fragment mode: path is provided
+      Keyword.has_key?(opts, :path) ->
+        path = Keyword.get(opts, :path, []) |> List.wrap()
+        type = Keyword.get(opts, :type)
+        subfields = Keyword.get(opts, :fields, [])
+
+        type_condition = type && %NamedType{name: to_string(type)}
+
+        inline_fragment = %InlineFragment{
+          type_condition: type_condition,
+          directives: [],
+          selection_set: %SelectionSet{selections: []}
+        }
+
+        optic = build_field_optic(path, :selections)
+        doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
+
+        subfield_path = path ++ [{nil, type: type}]
+
+        Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
+          add_subfield(acc_doc, subfield_def, subfield_path)
+        end)
+
+      true ->
+        raise ArgumentError,
+              "fragment/2 requires either :name and :type options (for named fragments) or :path option (for inline fragments)"
+    end
   end
 
   @doc """
@@ -1029,8 +1154,8 @@ defmodule GQL do
   Removing a fragment:
 
       iex> "query { user { id } }"
-      ...> |> #{@gql}.fragment(:UserFields, :User)
-      ...> |> #{@gql}.fragment(:PostInfo, :Post)
+      ...> |> #{@gql}.fragment(name: :UserFields, type: :User)
+      ...> |> #{@gql}.fragment(name: :PostInfo, type: :Post)
       ...> |> #{@gql}.remove_fragment(:UserFields)
       ...> |> #{@gql}.field("x", path: :PostInfo)
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
@@ -1048,7 +1173,7 @@ defmodule GQL do
   Removing a non-existent fragment does nothing:
 
       iex> "query { user { id } }"
-      ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.fragment(name: :UserFields, type: :User)
       ...> |> #{@gql}.remove_fragment(:NonExistent)
       ...> |> #{@gql}.field("x", path: :UserFields)
       ...> |> to_string() |> String.replace(~r/\\n[ ]*\\n/m, "\\n")
@@ -1090,7 +1215,7 @@ defmodule GQL do
   Spreading a fragment at the root level:
 
       iex> #{@gql}.new()
-      ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.fragment(name: :UserFields, type: :User)
       ...> |> #{@gql}.field(:name, path: [:UserFields])
       ...> |> #{@gql}.field(:email, path: [:UserFields])
       ...> |> #{@gql}.field(:user)
@@ -1111,7 +1236,7 @@ defmodule GQL do
   Spreading a fragment in a nested field:
 
       iex> #{@gql}.new()
-      ...> |> #{@gql}.fragment(:ContactInfo, :User)
+      ...> |> #{@gql}.fragment(name: :ContactInfo, type: :User)
       ...> |> #{@gql}.field(:email, path: [:ContactInfo])
       ...> |> #{@gql}.field(:phone, path: [:ContactInfo])
       ...> |> #{@gql}.field(:organization)
@@ -1184,124 +1309,6 @@ defmodule GQL do
   end
 
   @doc """
-  Adds an inline fragment for handling union or interface types at a specific path.
-
-  Inline fragments allow you to conditionally include fields based on the concrete type
-  of a union or interface. Unlike named fragments, inline fragments are defined directly
-  in the query without a separate fragment definition.
-
-  ## Examples
-
-  Adding an inline fragment to handle a union type:
-
-      iex> #{@gql}.new()
-      ...> |> #{@gql}.field(:search, args: %{term: "elixir"})
-      ...> |> #{@gql}.inline_fragment(:User, path: [:search])
-      ...> |> #{@gql}.field(:name, path: [:search, {nil, type: :User}])
-      ...> |> #{@gql}.field(:email, path: [:search, {nil, type: :User}])
-      ...> |> #{@gql}.inline_fragment(:Post, path: [:search])
-      ...> |> #{@gql}.field(:title, path: [:search, {nil, type: :Post}])
-      ...> |> #{@gql}.field(:content, path: [:search, {nil, type: :Post}])
-      ...> |> to_string()
-      \"\"\"
-      query {
-        search(term: "elixir") {
-          ... on User {
-            name
-            email
-          }
-          ... on Post {
-            title
-            content
-          }
-        }
-      }
-      \"\"\"
-
-  Adding an inline fragment without a type condition (for interfaces):
-
-      iex> #{@gql}.new()
-      ...> |> #{@gql}.field(:node, args: %{id: "123"})
-      ...> |> #{@gql}.field(:id, path: [:node])
-      ...> |> #{@gql}.inline_fragment(nil, path: [:node])
-      ...> |> #{@gql}.field(:__typename, path: [:node, {nil, type: nil}])
-      ...> |> to_string()
-      \"\"\"
-      query {
-        node(id: "123") {
-          id
-          ... {
-            __typename
-          }
-        }
-      }
-      \"\"\"
-
-  The `fields` option allows you to specify subfields directly within the inline fragment:
-
-      iex> #{@gql}.new()
-      ...> |> #{@gql}.field(:search, args: %{term: "elixir"})
-      ...> |> #{@gql}.inline_fragment(:User, path: [:search], fields: [:name, :email])
-      ...> |> #{@gql}.inline_fragment(:Post, path: [:search], fields: [:title, :content])
-      ...> |> to_string()
-      \"\"\"
-      query {
-        search(term: "elixir") {
-          ... on User {
-            name
-            email
-          }
-          ... on Post {
-            title
-            content
-          }
-        }
-      }
-      \"\"\"
-
-  Subfield definitions support the same options as the main field definition,
-  including `alias` and `args`:
-
-      iex> #{@gql}.new()
-      ...> |> #{@gql}.field(:search)
-      ...> |> #{@gql}.inline_fragment(:User, path: [:search], fields: [:id, {:name, alias: "fullName"}])
-      ...> |> to_string()
-      \"\"\"
-      query {
-        search {
-          ... on User {
-            id
-            fullName: name
-          }
-        }
-      }
-      \"\"\"
-
-  """
-  def inline_fragment(doc, type, opts \\ []) do
-    doc = parse(doc)
-    path = Keyword.get(opts, :path, []) |> List.wrap()
-    subfields = Keyword.get(opts, :fields, [])
-
-    type_condition = type && %NamedType{name: to_string(type)}
-
-    inline_fragment = %InlineFragment{
-      type_condition: type_condition,
-      directives: [],
-      selection_set: %SelectionSet{selections: []}
-    }
-
-    optic = build_field_optic(path, :selections)
-    doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
-
-    subfield_path = path ++ [{nil, type: type}]
-
-    Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
-      add_subfield(acc_doc, subfield_def, subfield_path)
-    end)
-  end
-
-  @doc """
   Inlines all fragment spreads into the main selection set for simplified document structure.
 
   This function replaces all fragment spreads (`...FragmentName`) with the actual fields
@@ -1314,7 +1321,7 @@ defmodule GQL do
   Inlining a simple fragment:
 
       iex> #{@gql}.new()
-      ...> |> #{@gql}.fragment(:UserFields, :User)
+      ...> |> #{@gql}.fragment(name: :UserFields, type: :User)
       ...> |> #{@gql}.field(:name, path: [:UserFields])
       ...> |> #{@gql}.field(:email, path: [:UserFields])
       ...> |> #{@gql}.field(:user)
@@ -1333,10 +1340,10 @@ defmodule GQL do
   Inlining multiple fragments:
 
       iex> #{@gql}.new()
-      ...> |> #{@gql}.fragment(:BasicInfo, :User)
+      ...> |> #{@gql}.fragment(name: :BasicInfo, type: :User)
       ...> |> #{@gql}.field(:id, path: [:BasicInfo])
       ...> |> #{@gql}.field(:name, path: [:BasicInfo])
-      ...> |> #{@gql}.fragment(:ContactInfo, :User)
+      ...> |> #{@gql}.fragment(name: :ContactInfo, type: :User)
       ...> |> #{@gql}.field(:email, path: [:ContactInfo])
       ...> |> #{@gql}.field(:phone, path: [:ContactInfo])
       ...> |> #{@gql}.field(:user)

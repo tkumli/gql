@@ -217,6 +217,53 @@ query {
 }
 ```
 
+### Nested Field Definitions
+
+Use the `fields` option to define nested fields more concisely:
+
+```elixir
+GQL.new()
+|> GQL.field(:user, fields: [:id, :name, :email])
+```
+
+This generates:
+
+```graphql
+query {
+  user {
+    id
+    name
+    email
+  }
+}
+```
+
+Subfields can also have options like `alias` and `args`:
+
+```elixir
+GQL.new()
+|> GQL.field(:user, fields: [
+  :id,
+  {:name, alias: "fullName"},
+  {:posts, args: %{limit: 5}, fields: [:title, :content]}
+])
+```
+
+This generates:
+
+```graphql
+query {
+  user {
+    id
+    fullName: name
+    posts(limit: 5) {
+      title
+      content
+    }
+  }
+}
+```
+
 ### Field Aliases
 
 Add aliases to fields:
@@ -454,6 +501,8 @@ query {
 
 ## Directives
 
+### Adding Directives to Fields
+
 Add directives like `@include` or `@skip` to fields:
 
 ```elixir
@@ -479,6 +528,52 @@ Add directives to nested fields:
 |> GQL.directive("skip", ["user", "email"], %{if: "$hideEmail"})
 ```
 
+This generates:
+
+```graphql
+query {
+  user {
+    name
+    email @skip(if: $hideEmail)
+  }
+}
+```
+
+### Adding Directives to Operations
+
+Add directives to the operation itself (query/mutation/subscription) by using an empty path:
+
+```elixir
+GQL.new(field: :user)
+|> GQL.field(:name, path: [:user])
+|> GQL.directive("cached", [])
+```
+
+This generates:
+
+```graphql
+query @cached {
+  user {
+    name
+  }
+}
+```
+
+With arguments:
+
+```elixir
+GQL.new(field: :user)
+|> GQL.directive("rateLimit", [], %{max: 100, window: 60})
+```
+
+This generates:
+
+```graphql
+query @rateLimit(max: 100, window: 60) {
+  user
+}
+```
+
 ## Fragments
 
 ### Named Fragments
@@ -487,7 +582,7 @@ Define reusable named fragments:
 
 ```elixir
 GQL.new()
-|> GQL.fragment(:UserFields, :User)
+|> GQL.fragment(name: :UserFields, type: :User)
 |> GQL.field(:name, path: [:UserFields])
 |> GQL.field(:email, path: [:UserFields])
 ```
@@ -509,7 +604,7 @@ Use fragment spreads to include fragments in queries:
 
 ```elixir
 GQL.new()
-|> GQL.fragment(:UserFields, :User)
+|> GQL.fragment(name: :UserFields, type: :User)
 |> GQL.field(:name, path: [:UserFields])
 |> GQL.field(:email, path: [:UserFields])
 |> GQL.field(:user)
@@ -530,13 +625,42 @@ fragment UserFields on User {
 }
 ```
 
+### Inlining Named Fragments
+
+Replace fragment spreads with their actual content:
+
+```elixir
+GQL.new()
+|> GQL.fragment(name: :UserFields, type: :User)
+|> GQL.field(:name, path: [:UserFields])
+|> GQL.field(:email, path: [:UserFields])
+|> GQL.field(:user)
+|> GQL.spread_fragment(:UserFields, path: [:user])
+|> GQL.inline_fragments()
+```
+
+This generates:
+
+```graphql
+query {
+  user {
+    name
+    email
+  }
+}
+```
+
+The `inline_fragments/1` function replaces all fragment spreads with the fields
+from the fragment definition and removes the fragment definitions. This is useful
+when you want to convert a document with named fragments into a single inline query.
+
 ### Removing Fragments
 
 Delete fragment definitions:
 
 ```elixir
 "query { user { id } }"
-|> GQL.fragment(:UserFields, :User)
+|> GQL.fragment(name: :UserFields, type: :User)
 |> GQL.remove_fragment(:UserFields)
 ```
 
@@ -557,10 +681,10 @@ Add inline fragments for handling union or interface types:
 ```elixir
 GQL.new()
 |> GQL.field(:search, args: %{term: "elixir"})
-|> GQL.inline_fragment(:User, path: [:search])
+|> GQL.fragment(type: :User, path: [:search])
 |> GQL.field(:name, path: [:search, {nil, type: :User}])
 |> GQL.field(:email, path: [:search, {nil, type: :User}])
-|> GQL.inline_fragment(:Post, path: [:search])
+|> GQL.fragment(type: :Post, path: [:search])
 |> GQL.field(:title, path: [:search, {nil, type: :Post}])
 |> GQL.field(:content, path: [:search, {nil, type: :Post}])
 ```
@@ -581,6 +705,17 @@ query {
   }
 }
 ```
+
+You can also use the `fields` option to add subfields directly:
+
+```elixir
+GQL.new()
+|> GQL.field(:search, args: %{term: "elixir"})
+|> GQL.fragment(type: :User, path: [:search], fields: [:name, :email])
+|> GQL.fragment(type: :Post, path: [:search], fields: [:title, :content])
+```
+
+This generates the same output as above but more concisely.
 
 ## Utilities
 
@@ -720,13 +855,13 @@ to_string(doc)
 - `remove_argument/3` - Remove an argument
 
 ### Directives
-- `directive/4` - Add a directive to a field
+- `directive/4` - Add a directive to a field or operation (use empty path `[]` for operation)
 
 ### Fragments
-- `fragment/3` - Define a named fragment
+- `fragment/2` - Define a named fragment (with `name:` and `type:` options) or add an inline fragment (with `path:` and `type:` options)
 - `remove_fragment/2` - Remove a fragment definition
 - `spread_fragment/3` - Spread a fragment into a selection
-- `inline_fragment/3` - Add an inline fragment
+- `inline_fragments/1` - Replace all fragment spreads with their content
 
 ### Utilities
 - `merge/2` - Merge two documents
