@@ -537,16 +537,16 @@ defmodule GQL do
   end
 
   # Helper function to add a single subfield
-  defp add_subfield(doc, subfield_name, path) when is_atom(subfield_name) do
-    field(doc, subfield_name, path: path)
-  end
-
   defp add_subfield(doc, {subfield_name, subfield_opts}, path) when is_list(subfield_opts) do
     if Keyword.has_key?(subfield_opts, :path) do
       raise ArgumentError, "the `path` option is not allowed in subfield definitions"
     end
 
     field(doc, subfield_name, Keyword.put(subfield_opts, :path, path))
+  end
+
+  defp add_subfield(doc, subfield_name, path) do
+    field(doc, subfield_name, path: path)
   end
 
   # Helper to resolve path into target filter and field path
