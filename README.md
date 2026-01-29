@@ -624,6 +624,30 @@ fragment UserFields on User {
   name
 }
 ```
+### Nesting fields and named fragments into each other
+
+Use the `fields` option to define nested fields more concisely:
+Use the `spread` field option to inlcude a named fragment more concisely:
+
+```elixir
+GQL.new()
+|> GQL.fragment(name: :UserFields, type: :User, fields: [:name, :email])
+|> GQL.field(:user, spread: [:UserFields])
+```
+
+This generates:
+
+```graphql
+query {
+  user {
+    ...UserFields
+  }
+}
+fragment UserFields on User {
+  email
+  name
+}
+```
 
 ### Inlining Named Fragments
 
@@ -716,6 +740,27 @@ GQL.new()
 ```
 
 This generates the same output as above but more concisely.
+
+You can also use the `spread_on` field option to add inline fragments to a field:
+
+```elixir
+GQL.new()
+|> GQL.field(:user, args: %{id: 42}, fields: [:id, :name], spread_on: [{:Admin, fields: [:permissions]}])
+```
+
+This generates:
+
+```graphql
+query {
+  user(id: 42) {
+    id
+    name
+    ... on Admin {
+      permissions
+    }
+  }
+}
+```
 
 ## Utilities
 
