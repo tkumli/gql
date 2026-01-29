@@ -518,25 +518,31 @@ defmodule GQL do
     path = Keyword.get(opts, :path, []) |> List.wrap()
     args = Keyword.get(opts, :args, [])
     subfields = Keyword.get(opts, :fields, [])
+    inline_fragments = Keyword.get(opts, :spread_on, [])
+    sread_fragment_names = Keyword.get(opts, :spread, [])
 
     field = %Field{name: name, alias: alias && to_string(alias), arguments: arguments(args)}
 
     {target_filter, field_path} = resolve_path_target(doc, path)
-
     optic = build_navigation_optic(target_filter, field_path)
 
-    doc = update_in(doc, optic, fn selection_list -> (selection_list || []) ++ [field] end)
-
-    # Add subfields if the fields option is present
     identifier = field_identifier(%{alias: alias, name: name})
-    subfield_path = path ++ [identifier]
+    sub_path = path ++ [identifier]
 
-    Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
-      add_subfield(acc_doc, subfield_def, subfield_path)
+    doc
+    |> update_in(optic, fn selection_list -> (selection_list || []) ++ [field] end)
+    |> add_subfields(subfields, sub_path)
+    |> spread_fragments(sread_fragment_names, sub_path)
+    |> add_inline_fragments(inline_fragments, sub_path)
+  end
+
+  # Helper function to add  subfields
+  defp add_subfields(doc, fields, path) do
+    Enum.reduce(fields, doc, fn field_def, acc_doc ->
+      add_subfield(acc_doc, field_def, path)
     end)
   end
 
-  # Helper function to add a single subfield
   defp add_subfield(doc, {subfield_name, subfield_opts}, path) when is_list(subfield_opts) do
     if Keyword.has_key?(subfield_opts, :path) do
       raise ArgumentError, "the `path` option is not allowed in subfield definitions"
@@ -549,11 +555,43 @@ defmodule GQL do
     field(doc, subfield_name, path: path)
   end
 
+  # Helper function to add a fragment names
+  defp spread_fragments(doc, frag_names, path) do
+    Enum.reduce(frag_names, doc, fn frag_name, acc_doc ->
+      GQL.spread_fragment(acc_doc, frag_name, path: path)
+    end)
+  end
+
+  # Helper function to add a inline fragments
+  defp add_inline_fragments(doc, frags, path) do
+    Enum.reduce(frags, doc, fn frag_def, acc_doc ->
+      add_inline_fragment(acc_doc, frag_def, path)
+    end)
+  end
+
+  defp add_inline_fragment(doc, {frag_type, frag_opts}, path) when is_list(frag_opts) do
+    if Keyword.has_key?(frag_opts, :path) do
+      raise ArgumentError, "the `path` option is not allowed in subfrag definitions"
+    end
+
+    opts =
+      frag_opts
+      |> Keyword.put(:type, frag_type)
+      |> Keyword.put(:path, path)
+
+    fragment(doc, opts)
+  end
+
+  defp add_inline_fragment(doc, frag_type, path) do
+    fragment(doc, type: frag_type, path: path)
+  end
+
   # Helper to resolve path into target filter and field path
   defp resolve_path_target(doc, path) do
     case path do
       [first | rest] ->
         first_str = to_string(first)
+
         has_fragment =
           Enum.any?(doc.definitions, fn
             %Fragment{name: ^first_str} -> true
@@ -1123,9 +1161,14 @@ defmodule GQL do
   def fragment(doc, opts \\ []) do
     doc = parse(doc)
 
+    subfields = Keyword.get(opts, :fields, [])
+    sub_inline_fragments = Keyword.get(opts, :spread_on, [])
+    sread_fragment_names = Keyword.get(opts, :spread, [])
+
     cond do
       # Named fragment mode: name and type are provided
       Keyword.has_key?(opts, :name) ->
+        path = Keyword.get(opts, :path, []) |> List.wrap()
         name = Keyword.fetch!(opts, :name)
         type = Keyword.fetch!(opts, :type)
 
@@ -1136,13 +1179,17 @@ defmodule GQL do
           selection_set: %SelectionSet{selections: []}
         }
 
+        sub_path = path ++ [name]
+
         %{doc | definitions: doc.definitions ++ [fragment]}
+        |> add_subfields(subfields, sub_path)
+        |> spread_fragments(sread_fragment_names, sub_path)
+        |> add_inline_fragments(sub_inline_fragments, sub_path)
 
       # Inline fragment mode: path is provided
       Keyword.has_key?(opts, :path) ->
         path = Keyword.get(opts, :path, []) |> List.wrap()
         type = Keyword.get(opts, :type)
-        subfields = Keyword.get(opts, :fields, [])
 
         type_condition = type && %NamedType{name: to_string(type)}
 
@@ -1153,22 +1200,19 @@ defmodule GQL do
         }
 
         optic = build_field_optic(path, :selections)
+        sub_path = path ++ [{nil, type: type}]
 
-        doc =
-          update_in(doc, optic, fn selection_list ->
-            (selection_list || []) ++ [inline_fragment]
-          end)
-
-        subfield_path = path ++ [{nil, type: type}]
-
-        Enum.reduce(subfields, doc, fn subfield_def, acc_doc ->
-          add_subfield(acc_doc, subfield_def, subfield_path)
-        end)
+        doc
+        |> update_in(optic, fn selection_list -> (selection_list || []) ++ [inline_fragment] end)
+        |> add_subfields(subfields, sub_path)
+        |> spread_fragments(sread_fragment_names, sub_path)
+        |> add_inline_fragments(sub_inline_fragments, sub_path)
 
       true ->
         raise ArgumentError,
               "fragment/2 requires either :name and :type options (for named fragments) or :path option (for inline fragments)"
     end
+
   end
 
   @doc """
