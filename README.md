@@ -626,7 +626,8 @@ fragment UserFields on User {
 ```
 ### Nesting fields and named fragments into each other
 
-Use the `fields` option to define nested fields more concisely:
+Use the `fields` option to define nested fields more concisely.
+
 Use the `spread` field option to inlcude a named fragment more concisely:
 
 ```elixir
